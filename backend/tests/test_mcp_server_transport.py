@@ -3,11 +3,15 @@ handshake, JSON-RPC dispatch."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.auth import mcp_tokens as tokens_repo
 from app.auth.mcp_tokens import TOKEN_PREFIX
+from app.db import models as orm
+from app.db.session import session as db_session
 from app.main import create_app
 from app.mcp_server import session as mcp_session
 
@@ -132,6 +136,46 @@ def test_initialize_creates_session_for_token_user(client):
     assert sess is not None
     assert sess.user_id == uid
     assert sess.initialized is False  # client must ack via notifications/initialized
+
+
+def test_cached_session_observes_initialization_from_another_worker(client, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    raw = _mint_token(uid)
+    auth = {"Authorization": f"Bearer {raw}"}
+
+    init_res = client.post("/api/mcp", json=_initialize_request(), headers=auth)
+    sess_id = init_res.headers["Mcp-Session-Id"]
+    cached = mcp_session.get(sess_id)
+    assert cached is not None and cached.initialized is False
+
+    # Simulate notifications/initialized being handled by another worker.
+    with db_session() as s:
+        row = s.get(orm.McpSession, sess_id)
+        assert row is not None
+        row.initialized = True
+
+    list_res = client.post(
+        "/api/mcp",
+        json={"jsonrpc": "2.0", "id": 7, "method": "tools/list"},
+        headers={**auth, "Mcp-Session-Id": sess_id},
+    )
+
+    assert list_res.status_code == 200
+    assert "result" in list_res.json()
+
+    def fail_db_session():
+        raise AssertionError("initialized session should have been written back to the local cache")
+
+    with monkeypatch.context() as cache_only:
+        cache_only.setattr(mcp_session, "db_session", fail_db_session)
+        refreshed = mcp_session.get(sess_id)
+    assert refreshed is not None and refreshed.initialized is True
+
+    monkeypatch.setattr(
+        mcp_session, "_now", lambda: datetime(2100, 1, 1, tzinfo=timezone.utc)
+    )
+    assert mcp_session.get(sess_id) is None
+    assert sess_id not in mcp_session.all_session_ids()
 
 
 # --------------------------------------------------------------------------- #
