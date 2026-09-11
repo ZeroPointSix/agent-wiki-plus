@@ -201,6 +201,8 @@ def test_list_for_doc_owner_display_falls_back_to_email(tmp_db):
     rows = agent_activity.list_for_doc("x.md")
     assert len(rows) == 1
     assert rows[0].owner_display == "nameless@x.com"
+
+
 def test_concurrent_upserts_keep_one_activity_row(tmp_db):
     from app.wiki import agent_activity
 
@@ -222,6 +224,29 @@ def test_concurrent_upserts_keep_one_activity_row(tmp_db):
     rows = agent_activity.list_all_active()
     assert len(rows) == 1
     assert rows[0].agent_name == "same-agent"
+
+
+def test_concurrent_null_agent_upserts_keep_one_activity_row(tmp_db):
+    from app.wiki import agent_activity
+
+    seed_user(uid="u1", email="u1@example.com")
+
+    def write(index: int) -> str:
+        return agent_activity.upsert_activity(
+            user_id="u1",
+            agent_name=None,
+            doc_path=f"doc-{index}.md",
+            activity="read",
+            description=None,
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        expiries = list(pool.map(write, range(16)))
+
+    assert all(expiries)
+    rows = agent_activity.list_all_active()
+    assert len(rows) == 1
+    assert rows[0].agent_name is None
 
 
 def test_cleanup_scheduler_cancels_stale_expiry(tmp_db, monkeypatch):

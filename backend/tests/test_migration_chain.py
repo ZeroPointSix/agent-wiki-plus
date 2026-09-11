@@ -9,6 +9,7 @@ down-then-up round trip, which nothing else exercises.
 
 from __future__ import annotations
 
+import pytest
 import sqlalchemy as sa
 from alembic import command
 from alembic.runtime.migration import MigrationContext
@@ -104,3 +105,100 @@ def test_topic_map_migration_round_trips(tmp_db):
         "aspect_id", "doc_id", "need_name",
     ]
     assert "topic_aspects" not in inspector.get_table_names()
+
+
+# Fingerprint index. ``0001`` create_all already materializes the column, so
+# CI never executes the upgrade body unless we rewind past this revision.
+_MCP_FINGERPRINT = "c4e8a1b2d3f6"
+
+
+def test_mcp_token_fingerprint_migration_round_trips(tmp_db):
+    """Downgrade past the fingerprint migration then upgrade, and check the shape.
+
+    Fresh databases skip ``upgrade()`` because the column already exists. A
+    rewind is the only way to run add-column / create-index and to prove
+    multiple NULL fingerprints remain legal afterwards (legacy bcrypt-only
+    rows).
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db.models import McpToken
+    from app.db.session import session
+
+    from tests._seed import seed_user
+
+    cfg = _alembic_config()
+    script = ScriptDirectory.from_config(cfg)
+    head = script.get_heads()[0]
+    parent = script.get_revision(_MCP_FINGERPRINT).down_revision
+    assert isinstance(parent, str)
+
+    inspector = sa.inspect(get_engine())
+    assert "token_fingerprint" in {c["name"] for c in inspector.get_columns("mcp_tokens")}
+    assert "idx_mcp_tokens_fingerprint" in {
+        i["name"] for i in inspector.get_indexes("mcp_tokens")
+    }
+
+    command.downgrade(cfg, parent)
+    inspector = sa.inspect(get_engine())
+    inspector.clear_cache()
+    assert "token_fingerprint" not in {
+        c["name"] for c in inspector.get_columns("mcp_tokens")
+    }
+    assert "idx_mcp_tokens_fingerprint" not in {
+        i["name"] for i in inspector.get_indexes("mcp_tokens")
+    }
+
+    command.upgrade(cfg, "head")
+    assert _current_revision() == head
+    inspector = sa.inspect(get_engine())
+    inspector.clear_cache()
+    columns = {c["name"]: c for c in inspector.get_columns("mcp_tokens")}
+    assert "token_fingerprint" in columns
+    assert columns["token_fingerprint"]["nullable"] is True
+    indexes = {i["name"]: i for i in inspector.get_indexes("mcp_tokens")}
+    fingerprint_idx = indexes["idx_mcp_tokens_fingerprint"]
+    assert fingerprint_idx["unique"] is True
+    assert fingerprint_idx["column_names"] == ["token_fingerprint"]
+
+    uid = seed_user(uid="u1", email="u1@x.com")
+    with session() as s:
+        s.add(
+            McpToken(
+                id="mtk_legacy_a",
+                user_id=uid,
+                name="legacy-a",
+                token_hash="hash-a",
+                token_fingerprint=None,
+            )
+        )
+        s.add(
+            McpToken(
+                id="mtk_legacy_b",
+                user_id=uid,
+                name="legacy-b",
+                token_hash="hash-b",
+                token_fingerprint=None,
+            )
+        )
+
+    with pytest.raises(IntegrityError):
+        with session() as s:
+            s.add(
+                McpToken(
+                    id="mtk_dup_a",
+                    user_id=uid,
+                    name="dup-a",
+                    token_hash="hash-dup-a",
+                    token_fingerprint="abc" * 8 + "a",
+                )
+            )
+            s.add(
+                McpToken(
+                    id="mtk_dup_b",
+                    user_id=uid,
+                    name="dup-b",
+                    token_hash="hash-dup-b",
+                    token_fingerprint="abc" * 8 + "a",
+                )
+            )

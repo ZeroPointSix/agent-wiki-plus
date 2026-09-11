@@ -165,6 +165,19 @@ def test_verify_after_revoke_fails(tmp_db):
     assert tokens_repo.verify(raw) is None
 
 
+def test_verify_rejects_token_revoked_during_bcrypt(tmp_db, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    token_id, raw = tokens_repo.create(uid, "k")
+    original = tokens_repo.verify_password
+
+    def revoke_then_check(candidate: str, hashed: str) -> bool:
+        assert tokens_repo.revoke(token_id, uid) is True
+        return original(candidate, hashed)
+
+    monkeypatch.setattr(tokens_repo, "verify_password", revoke_then_check)
+    assert tokens_repo.verify(raw) is None
+
+
 def test_revoke_other_users_token_is_noop(tmp_db):
     a = seed_user(uid="ua", email="a@x.com")
     b = seed_user(uid="ub", email="b@x.com")
