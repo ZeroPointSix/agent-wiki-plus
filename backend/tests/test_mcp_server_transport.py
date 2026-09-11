@@ -3,6 +3,8 @@ handshake, JSON-RPC dispatch."""
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -164,9 +166,16 @@ def test_cached_session_observes_initialization_from_another_worker(client, monk
     def fail_db_session():
         raise AssertionError("initialized session should have been written back to the local cache")
 
-    monkeypatch.setattr(mcp_session, "db_session", fail_db_session)
-    refreshed = mcp_session.get(sess_id)
+    with monkeypatch.context() as cache_only:
+        cache_only.setattr(mcp_session, "db_session", fail_db_session)
+        refreshed = mcp_session.get(sess_id)
     assert refreshed is not None and refreshed.initialized is True
+
+    monkeypatch.setattr(
+        mcp_session, "_now", lambda: datetime(2100, 1, 1, tzinfo=timezone.utc)
+    )
+    assert mcp_session.get(sess_id) is None
+    assert sess_id not in mcp_session.all_session_ids()
 
 
 # --------------------------------------------------------------------------- #
