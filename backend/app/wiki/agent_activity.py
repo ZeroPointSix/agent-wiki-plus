@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert
 
 from app.db.models import AgentActivity, User
 from app.db.session import session
@@ -170,32 +171,30 @@ def upsert_activity(
     expires_at = _iso(now + ttl)
     registered_at = _iso(now)
     with session() as s:
-        existing = s.scalar(
-            select(AgentActivity).where(
-                AgentActivity.user_id == user_id,
-                AgentActivity.agent_name.is_not_distinct_from(agent_name),
+        stmt = insert(AgentActivity).values(
+            user_id=user_id,
+            agent_name=agent_name,
+            doc_path=doc_path,
+            activity=activity,
+            description=description,
+            registered_at=registered_at,
+            expires_at=expires_at,
+            agent_session_id=agent_session_id,
+        )
+        s.execute(
+            stmt.on_conflict_do_update(
+                constraint="idx_agent_activity_user_agent",
+                set_={
+                    "doc_path": stmt.excluded.doc_path,
+                    "activity": stmt.excluded.activity,
+                    "description": stmt.excluded.description,
+                    "registered_at": stmt.excluded.registered_at,
+                    "expires_at": stmt.excluded.expires_at,
+                    "cleanup_msg_id": None,
+                    "agent_session_id": stmt.excluded.agent_session_id,
+                },
             )
         )
-        if existing is not None:
-            existing.doc_path = doc_path
-            existing.activity = activity
-            existing.description = description
-            existing.registered_at = registered_at
-            existing.expires_at = expires_at
-            existing.agent_session_id = agent_session_id
-        else:
-            s.add(
-                AgentActivity(
-                    user_id=user_id,
-                    agent_name=agent_name,
-                    doc_path=doc_path,
-                    activity=activity,
-                    description=description,
-                    registered_at=registered_at,
-                    expires_at=expires_at,
-                    agent_session_id=agent_session_id,
-                )
-            )
     log.debug(
         "agent_activity upsert user=%s agent=%s doc=%s activity=%s expires=%s",
         user_id,

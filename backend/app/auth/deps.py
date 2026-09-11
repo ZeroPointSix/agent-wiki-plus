@@ -20,6 +20,7 @@ from typing import Any
 
 from fastapi import Depends, HTTPException, Request, WebSocket
 from pydantic import BaseModel
+from sqlalchemy.exc import OperationalError, TimeoutError as SqlAlchemyTimeoutError
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
@@ -141,7 +142,20 @@ def require_bearer(request: Request) -> BearerPrincipal:
     if not header.startswith(_BEARER_PREFIX):
         raise HTTPException(status_code=401, detail="missing bearer token")
     raw = header[len(_BEARER_PREFIX) :].strip()
-    resolved = tokens_repo.verify(raw)
+    try:
+        resolved = tokens_repo.verify(raw)
+    except SqlAlchemyTimeoutError as exc:
+        log.exception("mcp bearer database pool timeout")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "database_pool_timeout", "message": "database is busy"},
+        ) from exc
+    except OperationalError as exc:
+        log.exception("mcp bearer database unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "database_unavailable", "message": "database is unavailable"},
+        ) from exc
     if resolved is None:
         log.info("mcp bearer rejected (token unrecognized)")
         raise HTTPException(status_code=401, detail="invalid bearer token")

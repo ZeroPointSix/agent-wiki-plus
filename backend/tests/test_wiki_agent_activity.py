@@ -6,9 +6,12 @@ Tests pull in ``tmp_db`` plus a seeded ``User`` row so the join in
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 import pytest
+
+from tests._seed import seed_user
 
 
 @pytest.fixture
@@ -198,3 +201,24 @@ def test_list_for_doc_owner_display_falls_back_to_email(tmp_db):
     rows = agent_activity.list_for_doc("x.md")
     assert len(rows) == 1
     assert rows[0].owner_display == "nameless@x.com"
+def test_concurrent_upserts_keep_one_activity_row(tmp_db):
+    from app.wiki import agent_activity
+
+    seed_user(uid="u1", email="u1@example.com")
+
+    def write(index: int) -> str:
+        return agent_activity.upsert_activity(
+            user_id="u1",
+            agent_name="same-agent",
+            doc_path=f"doc-{index}.md",
+            activity="read",
+            description=None,
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        expiries = list(pool.map(write, range(16)))
+
+    assert all(expiries)
+    rows = agent_activity.list_all_active()
+    assert len(rows) == 1
+    assert rows[0].agent_name == "same-agent"

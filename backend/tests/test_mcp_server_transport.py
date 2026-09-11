@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import TimeoutError as SqlAlchemyTimeoutError
 
 from app.auth import mcp_tokens as tokens_repo
 from app.auth.mcp_tokens import TOKEN_PREFIX
@@ -84,6 +85,21 @@ def test_revoked_token_is_401(client):
         headers={"Authorization": f"Bearer {raw}"},
     )
     assert res.status_code == 401
+
+
+def test_auth_pool_timeout_is_attributable_503(client, monkeypatch):
+    def fail(_raw: str):
+        raise SqlAlchemyTimeoutError("pool exhausted")
+
+    monkeypatch.setattr(tokens_repo, "verify", fail)
+    res = client.post(
+        "/api/mcp",
+        json=_initialize_request(),
+        headers={"Authorization": f"Bearer {TOKEN_PREFIX}{'z' * 32}"},
+    )
+
+    assert res.status_code == 503
+    assert res.json()["code"] == "database_pool_timeout"
 
 
 # --------------------------------------------------------------------------- #
@@ -343,6 +359,27 @@ def test_unknown_method_is_method_not_found(client):
     )
     body = res.json()
     assert body["error"]["code"] == -32601
+
+
+def test_dispatch_pool_timeout_has_stable_jsonrpc_code(client, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    raw = _mint_token(uid)
+    auth = {"Authorization": f"Bearer {raw}"}
+    res = client.post("/api/mcp", json=_initialize_request(), headers=auth)
+    sess_id = res.headers["Mcp-Session-Id"]
+
+    def fail(_session_id: str):
+        raise SqlAlchemyTimeoutError("pool exhausted")
+
+    monkeypatch.setattr(mcp_session, "get", fail)
+    res = client.post(
+        "/api/mcp",
+        json={"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        headers={**auth, "Mcp-Session-Id": sess_id},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["error"]["code"] == -32001
 
 
 def test_missing_jsonrpc_field_is_invalid_request(client):

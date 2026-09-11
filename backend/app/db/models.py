@@ -153,12 +153,23 @@ class McpToken(Base):
     )
     name: Mapped[str] = mapped_column(Text, nullable=False)
     token_hash: Mapped[str] = mapped_column(Text, unique=True, nullable=False)
+    # The bcrypt hash remains authoritative; this deterministic key only narrows
+    # authentication to one high-entropy token candidate.
+    token_fingerprint: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(
         Text, nullable=False, server_default=_NOW_TEXT_DEFAULT
     )
     last_used_at: Mapped[str | None] = mapped_column(Text)
 
-    __table_args__ = (Index("idx_mcp_tokens_user", "user_id"),)
+    __table_args__ = (
+        Index("idx_mcp_tokens_user", "user_id"),
+        Index(
+            "idx_mcp_tokens_fingerprint",
+            "token_fingerprint",
+            unique=True,
+            postgresql_where=text("token_fingerprint IS NOT NULL"),
+        ),
+    )
 
 
 class McpJob(Base):
