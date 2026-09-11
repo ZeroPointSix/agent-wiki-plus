@@ -36,7 +36,9 @@
   “先查再插”的唯一键竞争。
 - 数据库连接池超时和数据库不可用现在分别返回稳定、可检索的错误：
   HTTP 503 的 `database_pool_timeout` / `database_unavailable`，以及 JSON-RPC
-  `-32001` / `-32002`。未知异常仍保留标准 `-32603`。
+  `-32010` / `-32011`。这两个值避开 MCP SDK 已登记的
+  `-32001` request timeout 与 `-32002` resource not found；
+  未知异常仍保留标准 `-32603`。
 
 ## 观测
 

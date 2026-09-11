@@ -379,7 +379,7 @@ def test_dispatch_pool_timeout_has_stable_jsonrpc_code(client, monkeypatch):
     )
 
     assert res.status_code == 200
-    assert res.json()["error"]["code"] == -32001
+    assert res.json()["error"]["code"] == -32010
 
 
 def test_missing_jsonrpc_field_is_invalid_request(client):
