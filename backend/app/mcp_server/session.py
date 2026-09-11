@@ -129,24 +129,37 @@ def get(session_id: str | None) -> McpSession | None:
     """Return the session record, or ``None`` if unknown / expired.
 
     Reads the in-process cache first; falls back to Postgres so sessions
-    survive restarts. Fallback reads do NOT auto-populate the cache —
-    that's reserved for ``adopt_local()`` at SSE-stream open, so we
-    don't accidentally treat ad-hoc cross-restart JSON-RPC calls as
-    "locally active for pubsub fan-out".
+    survive restarts. An initialized cache entry is final because that
+    state only moves from false to true. A cached uninitialized entry is
+    refreshed from Postgres so another worker's
+    ``notifications/initialized`` update becomes visible.
+
+    Fallback reads do NOT auto-populate an absent cache entry — that's
+    reserved for ``adopt_local()`` at SSE-stream open, so we don't
+    accidentally treat ad-hoc cross-restart JSON-RPC calls as "locally
+    active for pubsub fan-out".
     """
     if session_id is None:
         return None
     with _local_lock:
         cached = _local_sessions.get(session_id)
-    if cached is not None:
+    if cached is not None and cached.initialized:
         return cached
+
     with db_session() as s:
         row = s.get(orm.McpSession, session_id)
         if row is None:
             return None
         if row.expires_at < _iso(_now()):
             return None
-        return _row_to_record(row)
+        record = _row_to_record(row)
+
+    if cached is not None and record.initialized:
+        with _local_lock:
+            current = _local_sessions.get(session_id)
+            if current is cached:
+                _local_sessions[session_id] = record
+    return record
 
 
 def adopt_local(session_id: str) -> McpSession | None:
