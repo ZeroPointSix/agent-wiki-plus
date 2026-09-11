@@ -42,4 +42,11 @@ COPY starter_templates ./starter_templates
 
 EXPOSE 8080
 
-CMD ["uvicorn", "--factory", "app.main:create_app", "--host", "0.0.0.0", "--port", "8080", "--workers", "2"]
+# ZER-1039: default to a single Uvicorn worker so MCP session state is not
+# split across processes. The long-term fix in session.get() re-reads
+# Postgres when a cached session is still uninitialized, but sticky routing
+# / single-worker remains the safest default for Streamable HTTP sessions.
+# Override with UVICORN_WORKERS=2 (or higher) only when sticky Mcp-Session-Id
+# routing is guaranteed in front of the backend.
+ENV UVICORN_WORKERS=1
+CMD ["sh", "-c", "exec uvicorn --factory app.main:create_app --host 0.0.0.0 --port 8080 --workers ${UVICORN_WORKERS:-1}"]
