@@ -25,6 +25,8 @@ import json
 import logging
 from typing import Any, cast
 
+from sqlalchemy.exc import OperationalError, TimeoutError as SqlAlchemyTimeoutError
+
 import hashlib
 
 from app.auth import PermissionDenied, require_can
@@ -187,6 +189,9 @@ def call_for_mcp(
 
     try:
         result = registry_dispatch(name, arguments)
+    except (SqlAlchemyTimeoutError, OperationalError):
+        log.exception("mcp tool database failure name=%s", name)
+        raise
     except Exception as exc:
         log.exception("mcp tool dispatch raised name=%s", name)
         return {"error": f"internal error: {exc}", "stale_paths": []}, True

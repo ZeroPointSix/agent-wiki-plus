@@ -19,9 +19,11 @@ import logging
 import secrets
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from threading import Lock
+from typing import Any, Generator
 
 from sqlalchemy import select
 
@@ -51,6 +53,31 @@ class _Candidate:
     user_id: str
     name: str
     token_hash: str
+
+
+@dataclass
+class _LegacyGate:
+    lock: Lock
+    users: int = 0
+
+
+_legacy_gates_guard = Lock()
+_legacy_gates: dict[str, _LegacyGate] = {}
+
+
+@contextmanager
+def _serialize_legacy(fingerprint: str) -> Generator[None]:
+    with _legacy_gates_guard:
+        gate = _legacy_gates.setdefault(fingerprint, _LegacyGate(lock=Lock()))
+        gate.users += 1
+    try:
+        with gate.lock:
+            yield
+    finally:
+        with _legacy_gates_guard:
+            gate.users -= 1
+            if gate.users == 0:
+                _legacy_gates.pop(fingerprint, None)
 
 
 def _candidate(row: McpToken) -> _Candidate:
@@ -139,6 +166,24 @@ def revoke(token_id: str, user_id: str) -> bool:
 
 
 def verify(raw_token: str) -> tuple[User, str] | None:
+    if not raw_token or not raw_token.startswith(TOKEN_PREFIX):
+        return None
+
+    fingerprint = _fingerprint(raw_token)
+    with session() as s:
+        indexed = s.scalar(
+            select(McpToken.id).where(McpToken.token_fingerprint == fingerprint)
+        )
+    if indexed is not None:
+        return _verify_once(raw_token)
+
+    # Only the first request for a legacy token performs the bcrypt scan.
+    # Waiters re-check the now-indexed row after the first request backfills it.
+    with _serialize_legacy(fingerprint):
+        return _verify_once(raw_token)
+
+
+def _verify_once(raw_token: str) -> tuple[User, str] | None:
     """Resolve a raw bearer token to ``(User, agent_name)``, or ``None``.
 
     Indexed tokens require one bcrypt check. Legacy rows without a fingerprint

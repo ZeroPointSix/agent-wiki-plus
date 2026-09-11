@@ -21,6 +21,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from sqlalchemy.exc import OperationalError, TimeoutError as SqlAlchemyTimeoutError
 
 import re
 
@@ -54,7 +55,20 @@ def _resolve_agent_session(request: Request, user: User) -> tuple[str, str] | tu
         return None, None
     if not _AGENT_SESSION_RE.match(header):
         raise HTTPException(status_code=400, detail="malformed agent session id")
-    row = agent_sessions_repo.get(header)
+    try:
+        row = agent_sessions_repo.get(header)
+    except SqlAlchemyTimeoutError as exc:
+        log.exception("mcp launcher session database pool timeout")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "database_pool_timeout", "message": "database is busy"},
+        ) from exc
+    except OperationalError as exc:
+        log.exception("mcp launcher session database unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "database_unavailable", "message": "database is unavailable"},
+        ) from exc
     if row is None:
         raise HTTPException(status_code=400, detail="unknown agent session id")
     if row["user_id"] != user.id:
@@ -62,7 +76,20 @@ def _resolve_agent_session(request: Request, user: User) -> tuple[str, str] | tu
             status_code=403,
             detail="agent session does not belong to this user",
         )
-    agent_sessions_repo.touch_activity(header)
+    try:
+        agent_sessions_repo.touch_activity(header)
+    except SqlAlchemyTimeoutError as exc:
+        log.exception("mcp launcher session touch pool timeout")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "database_pool_timeout", "message": "database is busy"},
+        ) from exc
+    except OperationalError as exc:
+        log.exception("mcp launcher session touch database unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "database_unavailable", "message": "database is unavailable"},
+        ) from exc
     return header, row["tool_id"]
 
 

@@ -222,3 +222,40 @@ def test_concurrent_upserts_keep_one_activity_row(tmp_db):
     rows = agent_activity.list_all_active()
     assert len(rows) == 1
     assert rows[0].agent_name == "same-agent"
+
+
+def test_cleanup_scheduler_cancels_stale_expiry(tmp_db, monkeypatch):
+    from app.tasks import agent_activity as activity_tasks
+    from app.wiki import agent_activity
+
+    seed_user(uid="u1", email="u1@example.com")
+    agent_activity.upsert_activity(
+        user_id="u1",
+        agent_name="same-agent",
+        doc_path="doc.md",
+        activity="read",
+        description=None,
+    )
+    canceled: list[int] = []
+    monkeypatch.setattr(
+        type(activity_tasks.cleanup_expired_activity),
+        "schedule",
+        lambda self, *args, **kwargs: 99,
+    )
+    monkeypatch.setattr(
+        activity_tasks,
+        "cancel_delayed_message",
+        lambda _queue, msg_id: canceled.append(msg_id),
+    )
+
+    activity_tasks.schedule_cleanup_for_natural_key(
+        user_id="u1",
+        agent_name="same-agent",
+        expires_at="2000-01-01T00:00:00+00:00",
+    )
+
+    row = agent_activity.get_by_natural_key(
+        user_id="u1", agent_name="same-agent"
+    )
+    assert row is not None
+    assert canceled == [99]

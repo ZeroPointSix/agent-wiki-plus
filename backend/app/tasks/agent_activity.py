@@ -96,13 +96,24 @@ def schedule_cleanup_for_natural_key(
             select(AgentActivity).where(
                 AgentActivity.user_id == user_id,
                 AgentActivity.agent_name.is_not_distinct_from(agent_name),
-            )
+            ).with_for_update()
         )
         if row is None:
             log.warning(
                 "agent_activity cleanup schedule: row gone, canceling new fire "
                 "user=%s agent=%s",
                 user_id, agent_name,
+            )
+            cancel_delayed_message(lightweight_maintenance_queue.name, new_msg_id)
+            return
+        if row.expires_at != expires_at:
+            log.debug(
+                "agent_activity cleanup schedule: expiry changed; canceling stale fire "
+                "user=%s agent=%s expected=%s current=%s",
+                user_id,
+                agent_name,
+                expires_at,
+                row.expires_at,
             )
             cancel_delayed_message(lightweight_maintenance_queue.name, new_msg_id)
             return

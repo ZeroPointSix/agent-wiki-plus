@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -114,6 +115,35 @@ def test_verify_backfills_legacy_fingerprint(tmp_db):
             select(McpToken.token_fingerprint).where(McpToken.id == token_id)
         )
     assert fingerprint == hashlib.sha256(raw.encode()).hexdigest()
+
+
+def test_concurrent_legacy_verify_scans_once(tmp_db, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    token_ids_and_raw = [
+        tokens_repo.create(uid, f"legacy-{index}") for index in range(12)
+    ]
+    target_id, raw = token_ids_and_raw[-1]
+    with session() as s:
+        s.execute(update(McpToken).values(token_fingerprint=None))
+
+    original = tokens_repo.verify_password
+    checked: list[str] = []
+
+    def spy(candidate: str, hashed: str) -> bool:
+        checked.append(hashed)
+        return original(candidate, hashed)
+
+    monkeypatch.setattr(tokens_repo, "verify_password", spy)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(tokens_repo.verify, [raw] * 16))
+
+    assert all(result is not None for result in results)
+    # One legacy scan plus one indexed bcrypt for each waiter.
+    assert len(checked) <= len(token_ids_and_raw) + 15
+    with session() as s:
+        target = s.get(McpToken, target_id)
+        assert target is not None
+        assert target.token_fingerprint is not None
 
 
 def test_verify_rejects_unknown_token(tmp_db):
