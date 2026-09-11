@@ -136,7 +136,7 @@ def test_initialize_creates_session_for_token_user(client):
     assert sess.initialized is False  # client must ack via notifications/initialized
 
 
-def test_cached_session_observes_initialization_from_another_worker(client):
+def test_cached_session_observes_initialization_from_another_worker(client, monkeypatch):
     uid = seed_user(uid="u1", email="u1@x.com")
     raw = _mint_token(uid)
     auth = {"Authorization": f"Bearer {raw}"}
@@ -160,6 +160,11 @@ def test_cached_session_observes_initialization_from_another_worker(client):
 
     assert list_res.status_code == 200
     assert "result" in list_res.json()
+
+    def fail_db_session():
+        raise AssertionError("initialized session should have been written back to the local cache")
+
+    monkeypatch.setattr(mcp_session, "db_session", fail_db_session)
     refreshed = mcp_session.get(sess_id)
     assert refreshed is not None and refreshed.initialized is True
 
