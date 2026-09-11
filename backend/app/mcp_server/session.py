@@ -109,7 +109,7 @@ def create(user: User) -> McpSession:
     """
     sid = _new_id()
     now = _now()
-    expires_at = _iso(now + _SESSION_TTL)
+    expires_at: str = _iso(now + _SESSION_TTL)
     with db_session() as s:
         row = orm.McpSession(
             id=sid,
@@ -150,9 +150,9 @@ def get(session_id: str | None) -> McpSession | None:
     """
     if session_id is None:
         return None
-    now_iso = _iso(_now())
+    now_iso: str = _iso(_now())
     with _local_lock:
-        cached = _local_sessions.get(session_id)
+        cached: McpSession | None = _local_sessions.get(session_id)
         if cached is not None and cached.expires_at < now_iso:
             _local_sessions.pop(session_id, None)
             cached = None
@@ -165,11 +165,11 @@ def get(session_id: str | None) -> McpSession | None:
             return None
         if row.expires_at < _iso(_now()):
             return None
-        record = _row_to_record(row)
+        record: McpSession = _row_to_record(row)
 
     if cached is not None and record.initialized:
         with _local_lock:
-            current = _local_sessions.get(session_id)
+            current: McpSession | None = _local_sessions.get(session_id)
             if current is cached:
                 _local_sessions[session_id] = record
     return record
@@ -192,7 +192,7 @@ def adopt_local(session_id: str) -> McpSession | None:
             return None
         row.last_used_at = _iso(now)
         row.expires_at = _iso(now + _SESSION_TTL)
-        record = _row_to_record(row)
+        record: McpSession = _row_to_record(row)
     with _local_lock:
         _local_sessions[session_id] = record
     return record
@@ -211,7 +211,7 @@ def mark_initialized(session_id: str | None) -> McpSession | None:
         if row is None:
             return None
         row.initialized = True
-        record = _row_to_record(row)
+        record: McpSession = _row_to_record(row)
     with _local_lock:
         if session_id in _local_sessions:
             _local_sessions[session_id] = record
@@ -225,8 +225,8 @@ def touch(session_id: str) -> None:
     notification).
     """
     now = _now()
-    last_used_at = _iso(now)
-    expires_at = _iso(now + _SESSION_TTL)
+    last_used_at: str = _iso(now)
+    expires_at: str = _iso(now + _SESSION_TTL)
     with db_session() as s:
         row = s.get(orm.McpSession, session_id)
         if row is None:
@@ -234,7 +234,7 @@ def touch(session_id: str) -> None:
         row.last_used_at = last_used_at
         row.expires_at = expires_at
     with _local_lock:
-        cached = _local_sessions.get(session_id)
+        cached: McpSession | None = _local_sessions.get(session_id)
         if cached is not None:
             _local_sessions[session_id] = cached.model_copy(update={"expires_at": expires_at})
 
@@ -293,7 +293,7 @@ def terminate(session_id: str) -> None:
 def reap_expired() -> int:
     """Delete every session whose ``expires_at`` is in the past. Cascade
     removes subscriptions. Returns the row count for logging."""
-    now_iso = _iso(_now())
+    now_iso: str = _iso(_now())
     with db_session() as s:
         count = execute_dml(s, delete(orm.McpSession).where(orm.McpSession.expires_at < now_iso))
     if count:
