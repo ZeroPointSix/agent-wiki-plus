@@ -4,21 +4,26 @@ Tokens are personal API keys an MCP client (Claude Code, Cursor, Codex,
 …) presents in an ``Authorization: Bearer mcp_<token>`` header to talk
 to the inbound MCP server.
 
-The raw token is shown to the user **once** at creation; the DB only
-stores a bcrypt hash. ``verify`` linearly walks every token row checking
-bcrypt — that's fine while the token count stays small (per-user,
-hand-minted). If we ever ship machine-generated tokens at scale, swap
-in a deterministic prefix index.
+The raw token is shown to the user **once** at creation; the DB stores a
+bcrypt verifier plus a SHA-256 lookup fingerprint. The fingerprint is safe to
+index because raw tokens carry 192 bits of entropy, while bcrypt remains the
+authority for verification. Legacy rows are backfilled after their first
+successful verification.
 
 See ``local_data/wiki/mcp-server/mcp-server.md`` for the full design.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets
+import time
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from threading import Lock
+from typing import Any, Generator
 
 from sqlalchemy import select
 
@@ -36,6 +41,47 @@ token can't be confused with a session cookie or another credential."""
 _TOKEN_BYTES = 24
 """24 bytes → 32 base64url chars after stripping padding. Plenty of
 entropy; short enough to copy-paste without wrap."""
+
+
+def _fingerprint(raw_token: str) -> str:
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    id: str
+    user_id: str
+    name: str
+    token_hash: str
+
+
+@dataclass
+class _LegacyGate:
+    lock: Lock
+    users: int = 0
+
+
+_legacy_gates_guard = Lock()
+_legacy_gates: dict[str, _LegacyGate] = {}
+
+
+@contextmanager
+def _serialize_legacy(fingerprint: str) -> Generator[None]:
+    with _legacy_gates_guard:
+        gate = _legacy_gates.setdefault(fingerprint, _LegacyGate(lock=Lock()))
+        gate.users += 1
+    try:
+        with gate.lock:
+            yield
+    finally:
+        with _legacy_gates_guard:
+            gate.users -= 1
+            if gate.users == 0:
+                _legacy_gates.pop(fingerprint, None)
+
+
+def _candidate(row: McpToken) -> _Candidate:
+    return _Candidate(row.id, row.user_id, row.name, row.token_hash)
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +131,7 @@ def create(user_id: str, name: str) -> tuple[str, str]:
     raw = TOKEN_PREFIX + secrets.token_urlsafe(_TOKEN_BYTES)
     token_id = "mtk_" + uuid.uuid4().hex[:12]
 
+    fingerprint = _fingerprint(raw)
     with session() as s:
         s.add(
             McpToken(
@@ -92,6 +139,7 @@ def create(user_id: str, name: str) -> tuple[str, str]:
                 user_id=user_id,
                 name=name,
                 token_hash=hash_password(raw),
+                token_fingerprint=fingerprint,
             )
         )
     log.info("mcp token created id=%s user_id=%s name=%s", token_id, user_id, name)
@@ -118,14 +166,31 @@ def revoke(token_id: str, user_id: str) -> bool:
 
 
 def verify(raw_token: str) -> tuple[User, str] | None:
-    """Resolve a raw bearer token to ``(User, agent_name)``, or ``None``
-    if the token is invalid / revoked / malformed. Constant-ish-time:
-    bcrypt is run against every row, so an attacker can't tell from
-    timing whether any prefix matched.
+    if not raw_token or not raw_token.startswith(TOKEN_PREFIX):
+        return None
 
-    ``agent_name`` is the token's user-supplied label, repurposed as
-    the agent identity that gets stamped onto activity rows and woven
-    into the git commit author.
+    fingerprint = _fingerprint(raw_token)
+    with session() as s:
+        indexed = s.scalar(
+            select(McpToken.id).where(McpToken.token_fingerprint == fingerprint)
+        )
+    if indexed is not None:
+        return _verify_once(raw_token)
+
+    # Only the first request for a legacy token performs the bcrypt scan.
+    # Waiters re-check the now-indexed row after the first request backfills it.
+    with _serialize_legacy(fingerprint):
+        return _verify_once(raw_token)
+
+
+def _verify_once(raw_token: str) -> tuple[User, str] | None:
+    """Resolve a raw bearer token to ``(User, agent_name)``, or ``None``.
+
+    Indexed tokens require one bcrypt check. Legacy rows without a fingerprint
+    are scanned once, then lazily backfilled. Candidate hashes are detached
+    before bcrypt so CPU-bound verification never occupies a pooled DB
+    connection. A second transaction confirms the token still exists before
+    returning, preserving immediate revocation semantics.
 
     On success, also bumps ``last_used_at`` so the UI can show "last
     used 3 minutes ago" without an extra audit trail.
@@ -133,36 +198,84 @@ def verify(raw_token: str) -> tuple[User, str] | None:
     if not raw_token or not raw_token.startswith(TOKEN_PREFIX):
         return None
 
+    fingerprint = _fingerprint(raw_token)
+    lookup_started = time.perf_counter()
     with session() as s:
-        # Linearly walk all tokens. At the scale of "a few keys per
-        # user" this is fine; if we ever ship many tokens, add a
-        # prefix-hash column to narrow the candidate set.
-        rows = s.scalars(select(McpToken)).all()
-        match: McpToken | None = None
-        for row in rows:
-            if verify_password(raw_token, row.token_hash):
-                match = row
-                break
-        if match is None:
-            return None
+        exact = s.scalar(
+            select(McpToken).where(McpToken.token_fingerprint == fingerprint)
+        )
+        legacy = (
+            []
+            if exact is not None
+            else [
+                _candidate(row)
+                for row in s.scalars(
+                    select(McpToken).where(McpToken.token_fingerprint.is_(None))
+                ).all()
+            ]
+        )
+        candidates = [_candidate(exact)] if exact is not None else legacy
+    lookup_ms = (time.perf_counter() - lookup_started) * 1000
 
-        user = s.get(UserRow, match.user_id)
+    bcrypt_started = time.perf_counter()
+    match = next(
+        (
+            candidate
+            for candidate in candidates
+            if verify_password(raw_token, candidate.token_hash)
+        ),
+        None,
+    )
+    bcrypt_ms = (time.perf_counter() - bcrypt_started) * 1000
+    if match is None:
+        log.debug(
+            "mcp auth miss lookup_ms=%.1f bcrypt_ms=%.1f candidates=%d legacy=%s",
+            lookup_ms,
+            bcrypt_ms,
+            len(candidates),
+            exact is None,
+        )
+        return None
+
+    finalize_started = time.perf_counter()
+    with session() as s:
+        current = s.get(McpToken, match.id)
+        if current is None:
+            return None
+        if current.token_fingerprint not in (None, fingerprint):
+            return None
+        if current.token_fingerprint is None:
+            current.token_fingerprint = fingerprint
+
+        user = s.get(UserRow, current.user_id)
         if user is None:
             log.warning(
                 "mcp token %s resolved to missing user %s; treating as invalid",
-                match.id,
-                match.user_id,
+                current.id,
+                current.user_id,
             )
             return None
 
-        match.last_used_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        current.last_used_at = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
-        return (
+        result = (
             User(
                 id=user.id,
                 email=user.email,
                 name=user.name,
                 is_admin=bool(user.is_admin),
             ),
-            match.name,
+            current.name,
         )
+    log.debug(
+        "mcp auth success lookup_ms=%.1f bcrypt_ms=%.1f finalize_ms=%.1f "
+        "candidates=%d legacy=%s",
+        lookup_ms,
+        bcrypt_ms,
+        (time.perf_counter() - finalize_started) * 1000,
+        len(candidates),
+        exact is None,
+    )
+    return result
