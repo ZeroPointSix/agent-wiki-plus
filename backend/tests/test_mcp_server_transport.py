@@ -450,4 +450,3 @@ def test_non_dict_body_is_400(client):
         headers={"Authorization": f"Bearer {raw}"},
     )
     assert res.status_code == 400
-
