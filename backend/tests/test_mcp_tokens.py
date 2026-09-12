@@ -1,10 +1,17 @@
 """Tests for the inbound MCP token surface — repo + HTTP endpoints."""
 from __future__ import annotations
 
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select, update
+from sqlalchemy.pool import QueuePool
 
 from app.auth import mcp_tokens as tokens_repo
+from app.db.models import McpToken
+from app.db.session import get_engine, session
 from app.main import create_app
 
 from tests._auth import login_fastapi
@@ -33,6 +40,12 @@ def test_create_returns_prefixed_raw_and_persists_hash(tmp_db):
     assert "token_hash" not in rows[0]
     assert "token" not in rows[0]
 
+    with session() as s:
+        stored = s.get(McpToken, token_id)
+        assert stored is not None
+        assert stored.token_fingerprint == hashlib.sha256(raw.encode()).hexdigest()
+        assert stored.token_fingerprint != raw
+
 
 def test_create_rejects_blank_name(tmp_db):
     uid = seed_user(uid="u1", email="u1@x.com")
@@ -53,6 +66,86 @@ def test_verify_round_trip_returns_user_and_agent_name(tmp_db):
     assert agent_name == "Claude Code"
 
 
+def test_verify_checks_only_the_indexed_candidate(tmp_db, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    for index in range(12):
+        tokens_repo.create(uid, f"other-{index}")
+    _, raw = tokens_repo.create(uid, "target")
+
+    original = tokens_repo.verify_password
+    checked: list[str] = []
+
+    def spy(candidate: str, hashed: str) -> bool:
+        checked.append(hashed)
+        return original(candidate, hashed)
+
+    monkeypatch.setattr(tokens_repo, "verify_password", spy)
+    assert tokens_repo.verify(raw) is not None
+    assert len(checked) == 1
+
+
+def test_verify_releases_connection_during_bcrypt(tmp_db, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    _, raw = tokens_repo.create(uid, "target")
+    original = tokens_repo.verify_password
+
+    def assert_released(candidate: str, hashed: str) -> bool:
+        pool = get_engine().pool
+        assert isinstance(pool, QueuePool)
+        assert pool.checkedout() == 0
+        return original(candidate, hashed)
+
+    monkeypatch.setattr(tokens_repo, "verify_password", assert_released)
+    assert tokens_repo.verify(raw) is not None
+
+
+def test_verify_backfills_legacy_fingerprint(tmp_db):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    token_id, raw = tokens_repo.create(uid, "legacy")
+    with session() as s:
+        s.execute(
+            update(McpToken)
+            .where(McpToken.id == token_id)
+            .values(token_fingerprint=None)
+        )
+
+    assert tokens_repo.verify(raw) is not None
+    with session() as s:
+        fingerprint = s.scalar(
+            select(McpToken.token_fingerprint).where(McpToken.id == token_id)
+        )
+    assert fingerprint == hashlib.sha256(raw.encode()).hexdigest()
+
+
+def test_concurrent_legacy_verify_scans_once(tmp_db, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    token_ids_and_raw = [
+        tokens_repo.create(uid, f"legacy-{index}") for index in range(12)
+    ]
+    target_id, raw = token_ids_and_raw[-1]
+    with session() as s:
+        s.execute(update(McpToken).values(token_fingerprint=None))
+
+    original = tokens_repo.verify_password
+    checked: list[str] = []
+
+    def spy(candidate: str, hashed: str) -> bool:
+        checked.append(hashed)
+        return original(candidate, hashed)
+
+    monkeypatch.setattr(tokens_repo, "verify_password", spy)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(tokens_repo.verify, [raw] * 16))
+
+    assert all(result is not None for result in results)
+    # One legacy scan plus one indexed bcrypt for each waiter.
+    assert len(checked) <= len(token_ids_and_raw) + 15
+    with session() as s:
+        target = s.get(McpToken, target_id)
+        assert target is not None
+        assert target.token_fingerprint is not None
+
+
 def test_verify_rejects_unknown_token(tmp_db):
     uid = seed_user(uid="u1", email="u1@x.com")
     tokens_repo.create(uid, "k")
@@ -69,6 +162,19 @@ def test_verify_after_revoke_fails(tmp_db):
     assert tokens_repo.verify(raw) is not None
 
     assert tokens_repo.revoke(token_id, uid) is True
+    assert tokens_repo.verify(raw) is None
+
+
+def test_verify_rejects_token_revoked_during_bcrypt(tmp_db, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    token_id, raw = tokens_repo.create(uid, "k")
+    original = tokens_repo.verify_password
+
+    def revoke_then_check(candidate: str, hashed: str) -> bool:
+        assert tokens_repo.revoke(token_id, uid) is True
+        return original(candidate, hashed)
+
+    monkeypatch.setattr(tokens_repo, "verify_password", revoke_then_check)
     assert tokens_repo.verify(raw) is None
 
 

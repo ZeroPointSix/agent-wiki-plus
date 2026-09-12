@@ -23,6 +23,8 @@ from __future__ import annotations
 import logging
 from typing import Any, cast
 
+from sqlalchemy.exc import OperationalError, TimeoutError as SqlAlchemyTimeoutError
+
 from app.auth import PermissionDenied, User
 from app.mcp_server import resources as mcp_resources
 from app.mcp_server import session as mcp_session
@@ -51,6 +53,8 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+DATABASE_POOL_TIMEOUT = -32010
+DATABASE_UNAVAILABLE = -32011
 
 
 class UnknownSessionError(Exception):
@@ -111,6 +115,16 @@ def dispatch(
     except UnknownSessionError:
         # Surfaced to the HTTP layer as a 404 so the client re-initializes.
         raise
+    except SqlAlchemyTimeoutError:
+        log.exception("mcp transport: database pool timeout method=%s", method)
+        if is_notification:
+            return None, session_id
+        return _error(request_id, DATABASE_POOL_TIMEOUT, "database pool timeout"), session_id
+    except OperationalError:
+        log.exception("mcp transport: database unavailable method=%s", method)
+        if is_notification:
+            return None, session_id
+        return _error(request_id, DATABASE_UNAVAILABLE, "database unavailable"), session_id
     except Exception:
         log.exception("mcp transport: handler raised for method=%s", method)
         if is_notification:

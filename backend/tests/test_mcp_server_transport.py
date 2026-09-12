@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import OperationalError, TimeoutError as SqlAlchemyTimeoutError
 
 from app.auth import mcp_tokens as tokens_repo
 from app.auth.mcp_tokens import TOKEN_PREFIX
@@ -14,6 +15,7 @@ from app.db import models as orm
 from app.db.session import session as db_session
 from app.main import create_app
 from app.mcp_server import session as mcp_session
+from app.mcp_server import transport as mcp_transport
 
 from tests._seed import seed_user
 
@@ -84,6 +86,44 @@ def test_revoked_token_is_401(client):
         headers={"Authorization": f"Bearer {raw}"},
     )
     assert res.status_code == 401
+
+
+def test_auth_pool_timeout_is_attributable_503(client, monkeypatch):
+    def fail(_raw: str):
+        raise SqlAlchemyTimeoutError("pool exhausted")
+
+    monkeypatch.setattr(tokens_repo, "verify", fail)
+    res = client.post(
+        "/api/mcp",
+        json=_initialize_request(),
+        headers={"Authorization": f"Bearer {TOKEN_PREFIX}{'z' * 32}"},
+    )
+
+    assert res.status_code == 503
+    assert res.json()["code"] == "database_pool_timeout"
+
+
+def test_auth_operational_error_is_attributable_503(client, monkeypatch):
+    def fail(_raw: str):
+        raise OperationalError("SELECT 1", {}, Exception("could not connect"))
+
+    monkeypatch.setattr(tokens_repo, "verify", fail)
+    res = client.post(
+        "/api/mcp",
+        json=_initialize_request(),
+        headers={"Authorization": f"Bearer {TOKEN_PREFIX}{'z' * 32}"},
+    )
+
+    assert res.status_code == 503
+    assert res.json()["code"] == "database_unavailable"
+
+
+def test_database_jsonrpc_codes_avoid_mcp_sdk_registry():
+    reserved = {-32000, -32001, -32002, -32020, -32021, -32022, -32042}
+    assert mcp_transport.DATABASE_POOL_TIMEOUT == -32010
+    assert mcp_transport.DATABASE_UNAVAILABLE == -32011
+    assert mcp_transport.DATABASE_POOL_TIMEOUT not in reserved
+    assert mcp_transport.DATABASE_UNAVAILABLE not in reserved
 
 
 # --------------------------------------------------------------------------- #
@@ -303,7 +343,6 @@ def test_uninitialized_session_sse_is_400(client):
     res = client.get("/api/mcp", headers={**auth, "Mcp-Session-Id": sess_id})
     assert res.status_code == 400
 
-
 def test_method_before_initialized_ack_is_error(client):
     uid = seed_user(uid="u1", email="u1@x.com")
     raw = _mint_token(uid)
@@ -345,6 +384,48 @@ def test_unknown_method_is_method_not_found(client):
     assert body["error"]["code"] == -32601
 
 
+def test_dispatch_pool_timeout_has_stable_jsonrpc_code(client, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    raw = _mint_token(uid)
+    auth = {"Authorization": f"Bearer {raw}"}
+    res = client.post("/api/mcp", json=_initialize_request(), headers=auth)
+    sess_id = res.headers["Mcp-Session-Id"]
+
+    def fail(_session_id: str):
+        raise SqlAlchemyTimeoutError("pool exhausted")
+
+    monkeypatch.setattr(mcp_session, "get", fail)
+    res = client.post(
+        "/api/mcp",
+        json={"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        headers={**auth, "Mcp-Session-Id": sess_id},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["error"]["code"] == -32010
+
+
+def test_dispatch_operational_error_has_stable_jsonrpc_code(client, monkeypatch):
+    uid = seed_user(uid="u1", email="u1@x.com")
+    raw = _mint_token(uid)
+    auth = {"Authorization": f"Bearer {raw}"}
+    res = client.post("/api/mcp", json=_initialize_request(), headers=auth)
+    sess_id = res.headers["Mcp-Session-Id"]
+
+    def fail(_session_id: str):
+        raise OperationalError("SELECT 1", {}, Exception("could not connect"))
+
+    monkeypatch.setattr(mcp_session, "get", fail)
+    res = client.post(
+        "/api/mcp",
+        json={"jsonrpc": "2.0", "id": 2, "method": "ping"},
+        headers={**auth, "Mcp-Session-Id": sess_id},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["error"]["code"] == -32011
+
+
 def test_missing_jsonrpc_field_is_invalid_request(client):
     uid = seed_user(uid="u1", email="u1@x.com")
     raw = _mint_token(uid)
@@ -368,3 +449,4 @@ def test_non_dict_body_is_400(client):
         headers={"Authorization": f"Bearer {raw}"},
     )
     assert res.status_code == 400
+
