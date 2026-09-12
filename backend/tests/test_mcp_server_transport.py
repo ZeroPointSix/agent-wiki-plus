@@ -343,6 +343,7 @@ def test_uninitialized_session_sse_is_400(client):
     res = client.get("/api/mcp", headers={**auth, "Mcp-Session-Id": sess_id})
     assert res.status_code == 400
 
+
 def test_method_before_initialized_ack_is_error(client):
     uid = seed_user(uid="u1", email="u1@x.com")
     raw = _mint_token(uid)
